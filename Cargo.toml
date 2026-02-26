@@ -5,10 +5,13 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.35", features = ["full"] }
-reqwest = { version = "0.11", features = ["json", "stream"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures = "0.3"
-image = "0.24"     # 核心图像处理库 (用于生成九宫格)
-base64 = "0.21"    # 将内存中的图片转为 Base64
+image = "0.24"
+base64 = "0.21"
 calamine = "0.22"
+rust_xlsxwriter = "0.72"
+regex = "1.10"
+zip = "0.6" # 👈 新增：用于物理撬开 Excel 提取底层图片
