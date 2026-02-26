@@ -31,7 +31,7 @@ struct Candidate {
 struct NodeResponse {
     success: bool,
     data: Option<Vec<Candidate>>,
-    #[allow(dead_code)] // 👈 消除 error 字段未被读取的警告
+    #[allow(dead_code)] 
     error: Option<String>,
 }
 
@@ -135,55 +135,79 @@ async fn create_grid_base64(client: &Client, candidates: &[Candidate]) -> Option
     Some(format!("data:image/jpeg;base64,{}", BASE64_STANDARD.encode(buffer.into_inner())))
 }
 
-// 🌟 修复：撕开静默失败的遮羞布，加入强制错误打印与更长的超时等待
 async fn fetch_1688_candidates(client: &Client, image_path: &str, force_full_crop: bool) -> Vec<Candidate> {
-    let node_api = "http://localhost:3000/search";
+    // 🚨 核心修复 1：绝对禁止使用 localhost，强制使用 127.0.0.1 绕开 Mac IPv6 拦截！
+    let node_api = "http://127.0.0.1:3000/search";
     let payload = json!({ "imagePath": image_path, "forceFullCrop": force_full_crop });
     
-    // 给爬虫留足 120 秒的时间
+    // 🚨 核心修复 2：将所有 eprintln! 替换为 println!，保证报错能写入 logs.txt 被你看见！
     match client.post(node_api).json(&payload).timeout(Duration::from_secs(120)).send().await {
         Ok(res) => {
-            if let Ok(node_res) = res.json::<NodeResponse>().await {
-                if node_res.success { 
-                    return node_res.data.unwrap_or_default(); 
-                } else {
-                    eprintln!("🛑 Node.js 业务报错: {:?}", node_res.error);
+            if res.status().is_success() {
+                if let Ok(node_res) = res.json::<NodeResponse>().await {
+                    if node_res.success { 
+                        return node_res.data.unwrap_or_default(); 
+                    } else {
+                        println!("🛑 Node.js 返回报错: {:?}", node_res.error);
+                    }
                 }
             } else {
-                eprintln!("🛑 Node.js 返回了无法解析的乱码格式！");
+                println!("🛑 Node.js 返回了非 200 状态码: {}", res.status());
             }
         }
         Err(e) => {
-            eprintln!("🚨 严重故障：无法连接到 Node.js 微服务！原因: {}", e);
-            eprintln!("💡 提示：请确保你已经在另一个终端运行了 `bun run server.ts`！");
+            println!("\n🚨🚨🚨 严重网络故障：Rust 无法连接到 Node.js 微服务！");
+            println!("详细错误: {}", e);
+            println!("请务必检查：1. 是否运行了 `bun run server.ts` 2. 端口是否对应 3000\n");
         }
     }
     vec![]
 }
 
-async fn verify_with_qwen_vl(client: &Client, ozon_image_base64: &str, grid_base64: &str, valid_count: usize, ozon_name: &str) -> Vec<usize> {
+// 🌟 需求满足：加入 ozon_name_opt，精准区分【一轮纯视觉盲搜】和【二轮图文联合感知】
+async fn verify_with_qwen_vl(client: &Client, ozon_image_base64: &str, grid_base64: &str, valid_count: usize, ozon_name_opt: Option<&str>) -> Vec<usize> {
     let api_key = env::var("DASHSCOPE_API_KEY").expect("❌ 找不到 DASHSCOPE_API_KEY");
     let api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
     
-    let user_prompt = format!(
-        "图 A 是目标商品原图。图 B 是候选商品九宫格（编号 1 到 9）。\n\
-        🚨 图 B 中只有前 {} 个格子有商品！\n\
-        🚨 买家要采购的真实商品名称是：【{}】（请利用你的多语言常识理解该商品的本质特征）。\n\
-        规则：\n\
-        1. 排除背景里的干扰物（如植物盆栽、桌子、模特等），紧紧围绕上述【商品名称】寻找同款！\n\
-        2. 忽略背景不同、文字语言差异、水印。\n\
-        3. 极其严格地核对【物理模具、形态、核心结构】。\n\
-        请先给出详细对比分析，再给出结论。严格输出 JSON 格式：\n\
-        {{\n  \"reasoning\": \"对比过程...\",\n  \"match_ids\": [1]\n}}",
-        valid_count, ozon_name
-    );
+    let system_prompt;
+    let user_prompt;
+
+    if let Some(name) = ozon_name_opt {
+        // 第二重召回专属：语义增强模式
+        system_prompt = "你是一个极其严谨的采购专家。拥有超强的多语言语义理解和图像排查能力。";
+        user_prompt = format!(
+            "图 A 是目标商品原图。图 B 是候选商品九宫格（编号 1 到 9）。\n\
+            🚨 图 B 中只有前 {} 个格子有商品！\n\
+            🚨 买家要采购的真实商品名称是：【{}】（请利用你的多语言常识理解该商品的本质特征）。\n\
+            规则：\n\
+            1. 排除背景里的干扰物（如植物盆栽、桌子、模特等），紧紧围绕上述【商品名称】寻找同款！\n\
+            2. 忽略背景不同、文字语言差异、水印。\n\
+            3. 极其严格地核对【物理模具、形态、核心结构】。\n\
+            请先给出详细对比分析，再给出结论。严格输出 JSON 格式：\n\
+            {{\n  \"reasoning\": \"对比过程...\",\n  \"match_ids\": [1]\n}}",
+            valid_count, name
+        );
+    } else {
+        // 第一重召回专属：纯视觉盲对模式
+        system_prompt = "你是一个极其严谨的采购专家。进行SKU级同款视觉鉴定。";
+        user_prompt = format!(
+            "图 A 是目标商品原图。图 B 是候选商品九宫格（编号 1 到 9）。\n\
+            🚨 图 B 中只有前 {} 个格子有商品！\n\
+            规则：\n\
+            1. 忽略背景不同、文字语言差异、水印。\n\
+            2. 极其严格地核对【物理模具、角色形态、核心结构、武器】。\n\
+            请先给出详细对比分析，再给出结论。严格输出 JSON 格式：\n\
+            {{\n  \"reasoning\": \"对比过程...\",\n  \"match_ids\": [1]\n}}",
+            valid_count
+        );
+    }
 
     let payload = json!({
         "model": "qwen3-vl-plus",
         "temperature": 0.01,
         "response_format": { "type": "json_object" },
         "messages": [
-            { "role": "system", "content": "你是一个极其严谨的采购专家。拥有超强的多语言语义理解和图像排查能力。" },
+            { "role": "system", "content": system_prompt },
             { "role": "user", "content": [
                 { "type": "text", "text": user_prompt },
                 { "type": "image_url", "image_url": { "url": ozon_image_base64 } },
@@ -192,7 +216,7 @@ async fn verify_with_qwen_vl(client: &Client, ozon_image_base64: &str, grid_base
         ]
     });
 
-    if let Ok(res) = client.post(api_url).header("Authorization", format!("Bearer {}", api_key)).timeout(Duration::from_secs(60)).send().await {
+    if let Ok(res) = client.post(api_url).header("Authorization", format!("Bearer {}", api_key)).json(&payload).timeout(Duration::from_secs(60)).send().await {
         if let Ok(body) = res.json::<serde_json::Value>().await {
             if let Some(content) = body["choices"][0]["message"]["content"].as_str() {
                 if let Ok(vlm_res) = serde_json::from_str::<VlmResponse>(content) {
@@ -220,7 +244,7 @@ async fn process_candidates(
     client: &Client, 
     ozon_base64: &str, 
     candidates: Vec<Candidate>,
-    ozon_name: &str
+    ozon_name_opt: Option<&str>
 ) -> Option<Candidate> {
     if candidates.is_empty() { return None; }
     
@@ -229,7 +253,7 @@ async fn process_candidates(
     
     for chunk in chunks {
         if let Some(grid_base64) = create_grid_base64(client, chunk).await {
-            let match_ids = verify_with_qwen_vl(client, ozon_base64, &grid_base64, chunk.len(), ozon_name).await;
+            let match_ids = verify_with_qwen_vl(client, ozon_base64, &grid_base64, chunk.len(), ozon_name_opt).await;
             for &id in &match_ids {
                 if id >= 1 && id <= chunk.len() {
                     all_verified_candidates.push(chunk[id - 1].clone());
@@ -317,7 +341,7 @@ async fn main() {
             let img_bytes = match target_img_bytes {
                 Some(b) => b,
                 None => {
-                    eprintln!("⚠️ 第 {} 行未能从 Excel 提取到嵌入图片，跳过", row_index + 1);
+                    println!("⚠️ 第 {} 行未能从 Excel 提取到嵌入图片，跳过", row_index + 1);
                     let _ = worksheet.write_string(current_write_row, col_len + 2, "Excel中无图");
                     current_write_row += 1;
                     continue;
@@ -329,26 +353,26 @@ async fn main() {
             let target_image_path = abs_img_path.to_string_lossy().to_string();
             let ozon_base64 = format!("data:image/jpeg;base64,{}", BASE64_STANDARD.encode(&img_bytes));
 
-            // 🌟 消除了 final_status_msg 未读取的警告
             let mut final_cheapest = None;
-            let mut final_status_msg = String::from("未找到同款");
+            let final_status_msg;
 
             println!("🌐 [第一重召回] 呼叫 Bun 获取 1688 默认框选数据...");
             let candidates_pass1 = fetch_1688_candidates(&client, &target_image_path, false).await;
             
             if !candidates_pass1.is_empty() {
-                if let Some(cheapest) = process_candidates(&client, &ozon_base64, candidates_pass1, &ozon_name).await {
+                // 第一重：纯视觉比对，传入 None
+                if let Some(cheapest) = process_candidates(&client, &ozon_base64, candidates_pass1, None).await {
                     println!("✅ 第一重召回成功锁定最低价！");
                     final_cheapest = Some(cheapest);
                     final_status_msg = "AI比对成功(一次召回)".to_string();
                 } else {
-                    println!("⚠️ 警告：第一重召回被大模型否决 (可能1688框偏了主体)。");
-                    println!("🔥 立即启动 [第二重召回]：向 Node 发送全图强制重绘指令！");
+                    println!("⚠️ 警告：第一重视觉召回(3轮)未找到同款，触发二次重绘！");
                     
                     let candidates_pass2 = fetch_1688_candidates(&client, &target_image_path, true).await;
                     
-                    if let Some(cheapest) = process_candidates(&client, &ozon_base64, candidates_pass2, &ozon_name).await {
-                        println!("🏆 绝杀！大模型利用『语义排错』，在第二重全图中成功揪出真同款！");
+                    // 第二重：语义注入，传入 Some(&ozon_name)
+                    if let Some(cheapest) = process_candidates(&client, &ozon_base64, candidates_pass2, Some(&ozon_name)).await {
+                        println!("🏆 绝杀！大模型利用『语义排错』，在二次全图中成功揪出真同款！");
                         final_cheapest = Some(cheapest);
                         final_status_msg = "AI比对成功(二次全图召回)".to_string();
                     } else {
