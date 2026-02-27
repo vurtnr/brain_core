@@ -43,7 +43,7 @@ struct VlmResponse {
 }
 
 // ==========================================
-// 2. Excel 底层图片暴力破壳引擎
+// 2. Excel 底层图片提取
 // ==========================================
 fn extract_wps_images(excel_path: &str) -> HashMap<String, Vec<u8>> {
     let file = File::open(excel_path).expect("无法打开 Excel 文件以提取底层图片");
@@ -135,37 +135,54 @@ async fn create_grid_base64(client: &Client, candidates: &[Candidate]) -> Option
     Some(format!("data:image/jpeg;base64,{}", BASE64_STANDARD.encode(buffer.into_inner())))
 }
 
-async fn fetch_1688_candidates(client: &Client, image_path: &str, force_full_crop: bool) -> Vec<Candidate> {
-    // 🚨 核心修复 1：绝对禁止使用 localhost，强制使用 127.0.0.1 绕开 Mac IPv6 拦截！
-    let node_api = "http://127.0.0.1:3000/search";
+async fn fetch_1688_candidates(client: &Client, image_path: &str, force_full_crop: bool) -> Option<Vec<Candidate>> {
+    let node_api = "http://127.0.0.1:8266/search";
     let payload = json!({ "imagePath": image_path, "forceFullCrop": force_full_crop });
     
-    // 🚨 核心修复 2：将所有 eprintln! 替换为 println!，保证报错能写入 logs.txt 被你看见！
-    match client.post(node_api).json(&payload).timeout(Duration::from_secs(120)).send().await {
-        Ok(res) => {
-            if res.status().is_success() {
-                if let Ok(node_res) = res.json::<NodeResponse>().await {
-                    if node_res.success { 
-                        return node_res.data.unwrap_or_default(); 
-                    } else {
-                        println!("🛑 Node.js 返回报错: {:?}", node_res.error);
+    let mut retry_count = 0;
+    loop {
+        match client.post(node_api).json(&payload).timeout(Duration::from_secs(180)).send().await {
+            Ok(res) => {
+                let status = res.status();
+                if status.is_success() {
+                    let text_body = res.text().await.unwrap_or_default();
+                    match serde_json::from_str::<NodeResponse>(&text_body) {
+                        Ok(node_res) => {
+                            if node_res.success { 
+                                return Some(node_res.data.unwrap_or_default()); 
+                            } else {
+                                println!("🛑 Node.js 返回业务报错: {:?}", node_res.error);
+                                return None; 
+                            }
+                        },
+                        Err(e) => {
+                            println!("🛑 [防劫持警报] JSON 解析失败: {}", e);
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
                     }
+                } else {
+                    // 🌟 修复关键点：如果遇到 500 代理报错，死磕重试，绝不抛弃数据跳过！
+                    let err_text = res.text().await.unwrap_or_default();
+                    println!("🛑 遭遇非 200 状态码: {}", status);
+                    println!("🚨 错误详情: {}", err_text.chars().take(200).collect::<String>());
+                    println!("⚠️ 触发熔断保护，等待 5 秒后重试...");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
                 }
-            } else {
-                println!("🛑 Node.js 返回了非 200 状态码: {}", res.status());
+            }
+            Err(e) => {
+                retry_count += 1;
+                println!("🚨 严重网络故障：无法连接 Node.js (第 {} 次重试)！等待 5 秒...", retry_count);
+                println!("错误详情: {}", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue; 
             }
         }
-        Err(e) => {
-            println!("\n🚨🚨🚨 严重网络故障：Rust 无法连接到 Node.js 微服务！");
-            println!("详细错误: {}", e);
-            println!("请务必检查：1. 是否运行了 `bun run server.ts` 2. 端口是否对应 3000\n");
-        }
     }
-    vec![]
 }
 
-// 🌟 需求满足：加入 ozon_name_opt，精准区分【一轮纯视觉盲搜】和【二轮图文联合感知】
-async fn verify_with_qwen_vl(client: &Client, ozon_image_base64: &str, grid_base64: &str, valid_count: usize, ozon_name_opt: Option<&str>) -> Vec<usize> {
+async fn verify_with_qwen_vl(client: &Client, ozon_image_base64: &str, grid_base64: &str, valid_count: usize, ozon_name_opt: Option<&str>) -> Option<Vec<usize>> {
     let api_key = env::var("DASHSCOPE_API_KEY").expect("❌ 找不到 DASHSCOPE_API_KEY");
     let api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
     
@@ -173,7 +190,6 @@ async fn verify_with_qwen_vl(client: &Client, ozon_image_base64: &str, grid_base
     let user_prompt;
 
     if let Some(name) = ozon_name_opt {
-        // 第二重召回专属：语义增强模式
         system_prompt = "你是一个极其严谨的采购专家。拥有超强的多语言语义理解和图像排查能力。";
         user_prompt = format!(
             "图 A 是目标商品原图。图 B 是候选商品九宫格（编号 1 到 9）。\n\
@@ -188,7 +204,6 @@ async fn verify_with_qwen_vl(client: &Client, ozon_image_base64: &str, grid_base
             valid_count, name
         );
     } else {
-        // 第一重召回专属：纯视觉盲对模式
         system_prompt = "你是一个极其严谨的采购专家。进行SKU级同款视觉鉴定。";
         user_prompt = format!(
             "图 A 是目标商品原图。图 B 是候选商品九宫格（编号 1 到 9）。\n\
@@ -216,17 +231,30 @@ async fn verify_with_qwen_vl(client: &Client, ozon_image_base64: &str, grid_base
         ]
     });
 
-    if let Ok(res) = client.post(api_url).header("Authorization", format!("Bearer {}", api_key)).json(&payload).timeout(Duration::from_secs(60)).send().await {
-        if let Ok(body) = res.json::<serde_json::Value>().await {
-            if let Some(content) = body["choices"][0]["message"]["content"].as_str() {
-                if let Ok(vlm_res) = serde_json::from_str::<VlmResponse>(content) {
-                    println!("💡 深度推理: {}", vlm_res.reasoning.replace('\n', " "));
-                    return vlm_res.match_ids;
+    match client.post(api_url).header("Authorization", format!("Bearer {}", api_key)).json(&payload).timeout(Duration::from_secs(60)).send().await {
+        Ok(response) => {
+            let status = response.status();
+            if !status.is_success() {
+                let err_text = response.text().await.unwrap_or_default();
+                println!("💥 大模型 API 崩溃或被限流！状态码: {} \n详情: {}", status, err_text);
+                return None; 
+            }
+            
+            if let Ok(body) = response.json::<serde_json::Value>().await {
+                if let Some(content) = body["choices"][0]["message"]["content"].as_str() {
+                    if let Ok(vlm_res) = serde_json::from_str::<VlmResponse>(content) {
+                        println!("💡 深度推理: {}", vlm_res.reasoning.replace('\n', " "));
+                        return Some(vlm_res.match_ids);
+                    }
                 }
             }
+            Some(vec![]) 
+        },
+        Err(e) => {
+            println!("💥 大模型网络请求失败: {}", e);
+            None 
         }
     }
-    vec![]
 }
 
 fn find_cheapest(candidates: Vec<Candidate>) -> Option<Candidate> {
@@ -245,23 +273,29 @@ async fn process_candidates(
     ozon_base64: &str, 
     candidates: Vec<Candidate>,
     ozon_name_opt: Option<&str>
-) -> Option<Candidate> {
-    if candidates.is_empty() { return None; }
+) -> Result<Option<Candidate>, &'static str> {
+    if candidates.is_empty() { return Ok(None); }
     
     let mut all_verified_candidates = Vec::new();
     let chunks: Vec<&[Candidate]> = candidates.chunks(9).take(3).collect();
     
     for chunk in chunks {
         if let Some(grid_base64) = create_grid_base64(client, chunk).await {
-            let match_ids = verify_with_qwen_vl(client, ozon_base64, &grid_base64, chunk.len(), ozon_name_opt).await;
-            for &id in &match_ids {
-                if id >= 1 && id <= chunk.len() {
-                    all_verified_candidates.push(chunk[id - 1].clone());
+            match verify_with_qwen_vl(client, ozon_base64, &grid_base64, chunk.len(), ozon_name_opt).await {
+                Some(match_ids) => {
+                    for &id in &match_ids {
+                        if id >= 1 && id <= chunk.len() {
+                            all_verified_candidates.push(chunk[id - 1].clone());
+                        }
+                    }
+                },
+                None => {
+                    return Err("大模型API调用异常/超时"); 
                 }
             }
         }
     }
-    find_cheapest(all_verified_candidates)
+    Ok(find_cheapest(all_verified_candidates))
 }
 
 // ==========================================
@@ -269,8 +303,13 @@ async fn process_candidates(
 // ==========================================
 #[tokio::main]
 async fn main() {
-    let client = Client::new();
-    println!("🚀 [Rust Brain] 启动跨国搜图全链路比价系统 (图文双驱漏斗版)...");
+    // 🌟 核心破局点：使用 .no_proxy() 强制断开与 Clash/VPN 的联系，直达 Node.js！
+    let client = reqwest::Client::builder()
+        .no_proxy() 
+        .build()
+        .expect("初始化 HTTP 客户端失败");
+
+    println!("🚀 [Rust Brain] 启动跨国搜图全链路比价系统 (无视代理+熔断重试版)...");
 
     println!("🔓 正在破解 Excel 底层图片加密库...");
     let wps_images = extract_wps_images("1.xlsx");
@@ -357,32 +396,51 @@ async fn main() {
             let final_status_msg;
 
             println!("🌐 [第一重召回] 呼叫 Bun 获取 1688 默认框选数据...");
-            let candidates_pass1 = fetch_1688_candidates(&client, &target_image_path, false).await;
             
-            if !candidates_pass1.is_empty() {
-                // 第一重：纯视觉比对，传入 None
-                if let Some(cheapest) = process_candidates(&client, &ozon_base64, candidates_pass1, None).await {
-                    println!("✅ 第一重召回成功锁定最低价！");
-                    final_cheapest = Some(cheapest);
-                    final_status_msg = "AI比对成功(一次召回)".to_string();
-                } else {
-                    println!("⚠️ 警告：第一重视觉召回(3轮)未找到同款，触发二次重绘！");
-                    
-                    let candidates_pass2 = fetch_1688_candidates(&client, &target_image_path, true).await;
-                    
-                    // 第二重：语义注入，传入 Some(&ozon_name)
-                    if let Some(cheapest) = process_candidates(&client, &ozon_base64, candidates_pass2, Some(&ozon_name)).await {
-                        println!("🏆 绝杀！大模型利用『语义排错』，在二次全图中成功揪出真同款！");
-                        final_cheapest = Some(cheapest);
-                        final_status_msg = "AI比对成功(二次全图召回)".to_string();
-                    } else {
-                        println!("❌ 两次召回均无果，确认为无同款。");
-                        final_status_msg = "无真实同款(两轮兜底)".to_string();
+            if let Some(candidates_pass1) = fetch_1688_candidates(&client, &target_image_path, false).await {
+                if !candidates_pass1.is_empty() {
+                    match process_candidates(&client, &ozon_base64, candidates_pass1, None).await {
+                        Ok(Some(cheapest)) => {
+                            println!("✅ 第一重召回成功锁定最低价！");
+                            final_cheapest = Some(cheapest);
+                            final_status_msg = "AI比对成功(一次召回)".to_string();
+                        },
+                        Ok(None) => {
+                            println!("⚠️ 警告：第一重视觉召回(3轮)确认无同款，触发二次重绘！");
+                            
+                            if let Some(candidates_pass2) = fetch_1688_candidates(&client, &target_image_path, true).await {
+                                match process_candidates(&client, &ozon_base64, candidates_pass2, Some(&ozon_name)).await {
+                                    Ok(Some(cheapest)) => {
+                                        println!("🏆 绝杀！大模型利用『语义排错』，在二次全图中成功揪出真同款！");
+                                        final_cheapest = Some(cheapest);
+                                        final_status_msg = "AI比对成功(二次全图召回)".to_string();
+                                    },
+                                    Ok(None) => {
+                                        println!("❌ 两次召回均无果，确认为无同款。");
+                                        final_status_msg = "无真实同款(两轮兜底)".to_string();
+                                    },
+                                    Err(e) => {
+                                        println!("⚠️ 第二重召回时大模型崩溃中断: {}", e);
+                                        final_status_msg = format!("大模型API异常: {}", e);
+                                    }
+                                }
+                            } else {
+                                println!("⚠️ Node.js 第二次重绘故障。");
+                                final_status_msg = "Node爬虫二次获取失败".to_string();
+                            }
+                        },
+                        Err(e) => {
+                            println!("⚠️ 第一重召回时大模型崩溃中断: {}", e);
+                            final_status_msg = format!("大模型API异常: {}", e);
+                        }
                     }
+                } else {
+                    println!("⚠️ Node.js 未提取到数据 (可能被风控拦截)。");
+                    final_status_msg = "爬虫被风控或无数据".to_string();
                 }
             } else {
-                println!("⚠️ Node.js 未返回任何数据，该商品搜索失败。");
-                final_status_msg = "爬虫未返回数据".to_string();
+                println!("⚠️ Node.js 爬虫持续断连异常。");
+                final_status_msg = "Node爬虫微服务宕机".to_string();
             }
 
             if let Some(cheapest) = final_cheapest {
