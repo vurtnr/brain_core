@@ -7,10 +7,11 @@ use reqwest::Client;
 use rust_xlsxwriter::{Color, Format, Workbook};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use zip::ZipArchive;
 
@@ -40,6 +41,17 @@ struct VlmResponse {
     #[serde(default)]
     reasoning: String,
     match_ids: Vec<usize>,
+}
+
+const GRID_CANDIDATE_SIZE: usize = 9;
+const MAX_VERIFY_GROUPS: usize = 4;
+const MAX_VERIFY_CANDIDATES: usize = GRID_CANDIDATE_SIZE * MAX_VERIFY_GROUPS;
+const FINAL_REVIEW_CANDIDATE_LIMIT: usize = 8;
+
+enum MatchSummary {
+    NoMatch,
+    Cheapest(Candidate),
+    MatchedButPriceUnavailable { total_matches: usize },
 }
 
 // ==========================================
@@ -112,16 +124,101 @@ async fn fetch_and_resize(client: &Client, url: &str, size: u32) -> Option<Dynam
     None
 }
 
+fn draw_filled_rect(
+    canvas: &mut image::DynamicImage,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    color: image::Rgba<u8>,
+) {
+    let x_end = (x + width).min(canvas.width());
+    let y_end = (y + height).min(canvas.height());
+    for py in y..y_end {
+        for px in x..x_end {
+            canvas.put_pixel(px, py, color);
+        }
+    }
+}
+
+fn draw_digit(
+    canvas: &mut image::DynamicImage,
+    x: u32,
+    y: u32,
+    digit: u32,
+    scale: u32,
+    color: image::Rgba<u8>,
+) {
+    const DIGIT_FONT_3X5: [[[u8; 3]; 5]; 10] = [
+        [[1, 1, 1], [1, 0, 1], [1, 0, 1], [1, 0, 1], [1, 1, 1]],
+        [[0, 1, 0], [1, 1, 0], [0, 1, 0], [0, 1, 0], [1, 1, 1]],
+        [[1, 1, 1], [0, 0, 1], [1, 1, 1], [1, 0, 0], [1, 1, 1]],
+        [[1, 1, 1], [0, 0, 1], [1, 1, 1], [0, 0, 1], [1, 1, 1]],
+        [[1, 0, 1], [1, 0, 1], [1, 1, 1], [0, 0, 1], [0, 0, 1]],
+        [[1, 1, 1], [1, 0, 0], [1, 1, 1], [0, 0, 1], [1, 1, 1]],
+        [[1, 1, 1], [1, 0, 0], [1, 1, 1], [1, 0, 1], [1, 1, 1]],
+        [[1, 1, 1], [0, 0, 1], [0, 0, 1], [0, 0, 1], [0, 0, 1]],
+        [[1, 1, 1], [1, 0, 1], [1, 1, 1], [1, 0, 1], [1, 1, 1]],
+        [[1, 1, 1], [1, 0, 1], [1, 1, 1], [0, 0, 1], [1, 1, 1]],
+    ];
+
+    let Some(pattern) = DIGIT_FONT_3X5.get(digit as usize) else {
+        return;
+    };
+
+    for (row_idx, row) in pattern.iter().enumerate() {
+        for (col_idx, bit) in row.iter().enumerate() {
+            if *bit == 1 {
+                draw_filled_rect(
+                    canvas,
+                    x + col_idx as u32 * scale,
+                    y + row_idx as u32 * scale,
+                    scale,
+                    scale,
+                    color,
+                );
+            }
+        }
+    }
+}
+
+fn draw_tile_index_label(
+    canvas: &mut image::DynamicImage,
+    tile_index: usize,
+    tile_size: u32,
+    grid_size: u32,
+) {
+    let x = (tile_index as u32 % grid_size) * tile_size;
+    let y = (tile_index as u32 / grid_size) * tile_size;
+
+    draw_filled_rect(
+        canvas,
+        x + 10,
+        y + 10,
+        46,
+        34,
+        image::Rgba([255, 255, 255, 220]),
+    );
+    draw_digit(
+        canvas,
+        x + 23,
+        y + 16,
+        (tile_index + 1) as u32,
+        4,
+        image::Rgba([0, 0, 0, 255]),
+    );
+}
+
 async fn create_grid_base64(client: &Client, candidates: &[Candidate]) -> Option<String> {
     let tile_size = 300;
-    let grid_size = 3;
+    let grid_size = (GRID_CANDIDATE_SIZE as f64).sqrt() as u32;
     let canvas_size = tile_size * grid_size;
     let canvas_img =
         image::RgbaImage::from_pixel(canvas_size, canvas_size, image::Rgba([255, 255, 255, 255]));
     let mut canvas = image::DynamicImage::ImageRgba8(canvas_img);
 
     let mut tasks = Vec::new();
-    for c in candidates.iter().take(9) {
+    for c in candidates.iter().take(GRID_CANDIDATE_SIZE) {
         tasks.push(fetch_and_resize(client, &c.image_url, tile_size));
     }
 
@@ -135,6 +232,7 @@ async fn create_grid_base64(client: &Client, candidates: &[Candidate]) -> Option
             let y = (index as u32 / grid_size) * tile_size;
             let _ = canvas.copy_from(&img, x, y);
         }
+        draw_tile_index_label(&mut canvas, index, tile_size, grid_size);
     }
 
     if !has_image {
@@ -233,26 +331,32 @@ async fn verify_with_qwen_vl(
     let user_prompt;
 
     if let Some(name) = ozon_name_opt {
-        system_prompt = "你是SKU同款鉴定器。只返回JSON，不要输出额外说明。";
+        system_prompt =
+            "你是SKU同款鉴定器。必须严格匹配同一物理模具，宁可漏判也不能误判。只返回JSON。";
         user_prompt = format!(
             "图 A 是目标商品原图。图 B 是候选商品九宫格（编号 1 到 9）。\n\
             🚨 图 B 中只有前 {} 个格子有商品！\n\
+            🚨 每个格子左上角有白底黑字编号，必须严格按图中编号返回，禁止用方位词推断编号。\n\
             🚨 商品名称参考：【{}】。\n\
             规则：\n\
             1. 只比较商品主体的物理结构/模具，忽略背景、文字、水印、角度。\n\
-            2. 若是同款就返回编号；无同款返回空数组。\n\
+            2. 仅当核心结构、部件形态、连接方式都一致才算同款；拿不准必须排除。\n\
+            3. 若是同款就返回编号；无同款返回空数组。\n\
             严格输出 JSON：\n\
             {{\n  \"reasoning\": \"简短结论\",\n  \"match_ids\": [1]\n}}",
             valid_count, name
         );
     } else {
-        system_prompt = "你是SKU同款鉴定器。只返回JSON，不要输出额外说明。";
+        system_prompt =
+            "你是SKU同款鉴定器。必须严格匹配同一物理模具，宁可漏判也不能误判。只返回JSON。";
         user_prompt = format!(
             "图 A 是目标商品原图。图 B 是候选商品九宫格（编号 1 到 9）。\n\
             🚨 图 B 中只有前 {} 个格子有商品！\n\
+            🚨 每个格子左上角有白底黑字编号，必须严格按图中编号返回，禁止用方位词推断编号。\n\
             规则：\n\
             1. 只比较商品主体的物理结构/模具，忽略背景、文字、水印、角度。\n\
-            2. 若是同款就返回编号；无同款返回空数组。\n\
+            2. 仅当核心结构、部件形态、连接方式都一致才算同款；拿不准必须排除。\n\
+            3. 若是同款就返回编号；无同款返回空数组。\n\
             严格输出 JSON：\n\
             {{\n  \"reasoning\": \"简短结论\",\n  \"match_ids\": [1]\n}}",
             valid_count
@@ -311,32 +415,43 @@ async fn verify_with_qwen_vl(
 }
 
 fn parse_price_value(price: &str) -> Option<f64> {
-    let cleaned = price.replace(['¥', ','], "");
-    let mut numbers = Vec::new();
-    let mut current = String::new();
+    static CURRENCY_RE: OnceLock<Regex> = OnceLock::new();
+    static YUAN_RE: OnceLock<Regex> = OnceLock::new();
+    static PURE_RE: OnceLock<Regex> = OnceLock::new();
 
-    for ch in cleaned.chars() {
-        if ch.is_ascii_digit() || ch == '.' {
-            current.push(ch);
-        } else if !current.is_empty() {
-            if let Ok(value) = current.parse::<f64>() {
-                if value.is_finite() {
-                    numbers.push(value);
-                }
-            }
-            current.clear();
-        }
+    fn parse_min(captures: &regex::Captures, first: usize, second: usize) -> Option<f64> {
+        let first_value = captures
+            .get(first)
+            .and_then(|m| m.as_str().parse::<f64>().ok())
+            .filter(|v| v.is_finite())?;
+        let second_value = captures
+            .get(second)
+            .and_then(|m| m.as_str().parse::<f64>().ok())
+            .filter(|v| v.is_finite());
+        Some(second_value.map_or(first_value, |v| first_value.min(v)))
     }
 
-    if !current.is_empty() {
-        if let Ok(value) = current.parse::<f64>() {
-            if value.is_finite() {
-                numbers.push(value);
-            }
-        }
+    let normalized = price.replace([',', '，'], "");
+    let currency_re = CURRENCY_RE.get_or_init(|| {
+        Regex::new(r"[¥￥]\s*([0-9]+(?:\.[0-9]+)?)\s*(?:[-~至]\s*([0-9]+(?:\.[0-9]+)?))?").unwrap()
+    });
+    if let Some(cap) = currency_re.captures(&normalized) {
+        return parse_min(&cap, 1, 2);
     }
 
-    numbers.into_iter().reduce(f64::min)
+    let yuan_re = YUAN_RE.get_or_init(|| {
+        Regex::new(r"([0-9]+(?:\.[0-9]+)?)\s*(?:[-~至]\s*([0-9]+(?:\.[0-9]+)?))?\s*元").unwrap()
+    });
+    if let Some(cap) = yuan_re.captures(&normalized) {
+        return parse_min(&cap, 1, 2);
+    }
+
+    let pure_re = PURE_RE.get_or_init(|| {
+        Regex::new(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*(?:[-~至]\s*([0-9]+(?:\.[0-9]+)?))?\s*$").unwrap()
+    });
+    pure_re
+        .captures(&normalized)
+        .and_then(|cap| parse_min(&cap, 1, 2))
 }
 
 fn parse_positive_price_value(price: &str) -> Option<f64> {
@@ -363,17 +478,11 @@ fn build_verification_chunks(mut candidates: Vec<Candidate>) -> Vec<Vec<Candidat
     sort_candidates_by_price(&mut candidates);
     candidates
         .into_iter()
-        .take(27)
+        .take(MAX_VERIFY_CANDIDATES)
         .collect::<Vec<_>>()
-        .chunks(9)
+        .chunks(GRID_CANDIDATE_SIZE)
         .map(|chunk| chunk.to_vec())
         .collect()
-}
-
-#[derive(Debug)]
-struct StabilityMetrics {
-    jaccard: f64,
-    cheapest_id_stable: bool,
 }
 
 fn normalize_match_ids(match_ids: &[usize], valid_count: usize) -> Vec<usize> {
@@ -394,70 +503,6 @@ fn collect_matched_candidates(chunk: &[Candidate], match_ids: &[usize]) -> Vec<C
         .collect()
 }
 
-fn min_price_in_candidates(candidates: &[Candidate]) -> Option<f64> {
-    candidates
-        .iter()
-        .filter_map(|c| parse_positive_price_value(&c.price))
-        .reduce(f64::min)
-}
-
-fn min_price_in_chunk(chunk: &[Candidate]) -> Option<f64> {
-    chunk
-        .iter()
-        .filter_map(|c| parse_positive_price_value(&c.price))
-        .reduce(f64::min)
-}
-
-fn compute_gap_ratio(current_best_price: f64, next_chunk_min_price: Option<f64>) -> Option<f64> {
-    if current_best_price <= 0.0 {
-        return None;
-    }
-    next_chunk_min_price.map(|next_price| (next_price - current_best_price) / current_best_price)
-}
-
-fn should_probe_next_chunk(
-    hit_count: usize,
-    stability: Option<&StabilityMetrics>,
-    gap_ratio: Option<f64>,
-    has_next_chunk: bool,
-) -> bool {
-    const SINGLE_HIT_GAP_THRESHOLD: f64 = 0.12;
-    const TWO_HIT_STABILITY_THRESHOLD: f64 = 0.5;
-    const SINGLE_HIT_GAP_THRESHOLD_NO_STABILITY: f64 = 0.08;
-    const TWO_HIT_GAP_THRESHOLD_NO_STABILITY: f64 = 0.03;
-
-    if !has_next_chunk {
-        return false;
-    }
-    if hit_count == 0 || hit_count >= 3 {
-        return false;
-    }
-
-    let Some(stability) = stability else {
-        return match hit_count {
-            1 => gap_ratio
-                .map(|gap| gap < SINGLE_HIT_GAP_THRESHOLD_NO_STABILITY)
-                .unwrap_or(false),
-            2 => gap_ratio
-                .map(|gap| gap < TWO_HIT_GAP_THRESHOLD_NO_STABILITY)
-                .unwrap_or(false),
-            _ => false,
-        };
-    };
-
-    if hit_count == 2 {
-        return !(stability.jaccard >= TWO_HIT_STABILITY_THRESHOLD && stability.cheapest_id_stable);
-    }
-
-    if stability.jaccard >= 1.0 && stability.cheapest_id_stable {
-        return gap_ratio
-            .map(|gap| gap < SINGLE_HIT_GAP_THRESHOLD)
-            .unwrap_or(false);
-    }
-
-    true
-}
-
 fn find_cheapest(candidates: Vec<Candidate>) -> Option<Candidate> {
     let mut valid_items = candidates;
     if valid_items.is_empty() {
@@ -469,106 +514,193 @@ fn find_cheapest(candidates: Vec<Candidate>) -> Option<Candidate> {
         .find(|item| parse_positive_price_value(&item.price).is_some())
 }
 
+fn summarize_matches(candidates: Vec<Candidate>) -> MatchSummary {
+    if candidates.is_empty() {
+        return MatchSummary::NoMatch;
+    }
+
+    let total_matches = candidates.len();
+    match find_cheapest(candidates) {
+        Some(cheapest) => MatchSummary::Cheapest(cheapest),
+        None => MatchSummary::MatchedButPriceUnavailable { total_matches },
+    }
+}
+
+fn prepare_final_review_candidates(candidates: Vec<Candidate>, limit: usize) -> Vec<Candidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut seen_urls = HashSet::new();
+    let mut deduped = Vec::new();
+    for candidate in candidates {
+        if seen_urls.insert(candidate.item_url.clone()) {
+            deduped.push(candidate);
+        }
+    }
+
+    sort_candidates_by_price(&mut deduped);
+    deduped
+        .into_iter()
+        .filter(|item| parse_positive_price_value(&item.price).is_some())
+        .take(limit)
+        .collect()
+}
+
+async fn verify_single_candidate(
+    client: &Client,
+    ozon_base64: &str,
+    candidate: &Candidate,
+    ozon_name_opt: Option<&str>,
+) -> Option<bool> {
+    let single_candidate_grid = create_grid_base64(client, std::slice::from_ref(candidate)).await?;
+    let match_ids = verify_with_qwen_vl(
+        client,
+        ozon_base64,
+        &single_candidate_grid,
+        1,
+        ozon_name_opt,
+    )
+    .await?;
+    let normalized = normalize_match_ids(&match_ids, 1);
+    Some(normalized.contains(&1))
+}
+
+async fn pick_cheapest_after_final_review(
+    client: &Client,
+    ozon_base64: &str,
+    candidates: Vec<Candidate>,
+    ozon_name_opt: Option<&str>,
+) -> MatchSummary {
+    let prepared =
+        prepare_final_review_candidates(candidates.clone(), FINAL_REVIEW_CANDIDATE_LIMIT);
+    if prepared.is_empty() {
+        return summarize_matches(candidates);
+    }
+
+    println!(
+        "🔎 启动终选复核：按价格前 {} 条逐条做一对一确认...",
+        prepared.len()
+    );
+
+    let mut has_successful_review = false;
+    for (index, candidate) in prepared.iter().enumerate() {
+        match verify_single_candidate(client, ozon_base64, candidate, ozon_name_opt).await {
+            Some(true) => {
+                println!(
+                    "✅ 终选复核通过：第 {} 个候选确认同款，价格 {}",
+                    index + 1,
+                    candidate.price
+                );
+                return MatchSummary::Cheapest(candidate.clone());
+            }
+            Some(false) => {
+                has_successful_review = true;
+                println!("⚠️ 终选复核排除第 {} 个候选。", index + 1);
+            }
+            None => {
+                println!("⚠️ 终选复核请求失败，跳过第 {} 个候选。", index + 1);
+            }
+        }
+    }
+
+    if has_successful_review {
+        MatchSummary::NoMatch
+    } else {
+        summarize_matches(candidates)
+    }
+}
+
 async fn process_candidates(
     client: &Client,
     ozon_base64: &str,
     candidates: Vec<Candidate>,
     ozon_name_opt: Option<&str>,
-) -> Result<Option<Candidate>, &'static str> {
+) -> Result<MatchSummary, &'static str> {
     let chunks = build_verification_chunks(candidates);
     if chunks.is_empty() {
-        return Ok(None);
+        return Ok(MatchSummary::NoMatch);
     }
 
-    let mut pending_low_confidence_matches: Option<Vec<Candidate>> = None;
+    println!(
+        "⚡ 并发启动 {} 个九宫格比对任务（最多 {} 组）...",
+        chunks.len(),
+        MAX_VERIFY_GROUPS
+    );
 
-    for (chunk_index, chunk) in chunks.iter().enumerate() {
-        if let Some(grid_base64) = create_grid_base64(client, chunk).await {
+    let ozon_base64_owned = ozon_base64.to_owned();
+    let ozon_name_owned = ozon_name_opt.map(str::to_owned);
+    let compare_tasks = chunks.into_iter().enumerate().map(|(chunk_index, chunk)| {
+        let client = client.clone();
+        let ozon_base64 = ozon_base64_owned.clone();
+        let ozon_name = ozon_name_owned.clone();
+        tokio::spawn(async move {
+            let grid_base64 = create_grid_base64(&client, &chunk).await;
+            let Some(grid_base64) = grid_base64 else {
+                println!(
+                    "⚠️ 第 {} 组九宫格生成失败（图片下载异常）。",
+                    chunk_index + 1
+                );
+                return Ok(Vec::new());
+            };
+
             let verify_result = verify_with_qwen_vl(
-                client,
-                ozon_base64,
+                &client,
+                &ozon_base64,
                 &grid_base64,
                 chunk.len(),
-                ozon_name_opt,
+                ozon_name.as_deref(),
             )
             .await;
 
-            let match_ids = match verify_result {
-                Some(ids) => ids,
-                None => {
-                    if let Some(pending) = pending_low_confidence_matches.take() {
-                        println!("⚠️ 复查组模型请求失败，采用上一组低价命中结果。");
-                        return Ok(find_cheapest(pending));
-                    }
-                    return Err("大模型API调用异常/超时");
-                }
+            let Some(match_ids) = verify_result else {
+                println!("⚠️ 第 {} 组大模型请求失败。", chunk_index + 1);
+                return Err("大模型API调用异常/超时");
             };
 
-            let matched_candidates = collect_matched_candidates(chunk, &match_ids);
-
-            if let Some(mut pending) = pending_low_confidence_matches.take() {
-                if !matched_candidates.is_empty() {
-                    pending.extend(matched_candidates);
-                } else {
-                    println!("✅ 复查下一组未新增命中，采用上一组低价命中结果。");
-                }
-                println!("✅ 已完成低置信兜底复查，停止后续组比对。");
-                return Ok(find_cheapest(pending));
-            }
-
-            if matched_candidates.is_empty() {
-                continue;
-            }
-
-            let has_next_chunk = chunk_index + 1 < chunks.len();
-
-            let gap_ratio = min_price_in_candidates(&matched_candidates).and_then(|best_price| {
-                compute_gap_ratio(
-                    best_price,
-                    chunks
-                        .get(chunk_index + 1)
-                        .and_then(|c| min_price_in_chunk(c)),
-                )
-            });
-
-            if should_probe_next_chunk(
-                matched_candidates.len(),
-                None,
-                gap_ratio,
-                has_next_chunk,
-            ) {
-                println!(
-                    "⚠️ 第 {} 组触发价格邻近复查(hit_count={}，gap_ratio={:?})。",
-                    chunk_index + 1,
-                    matched_candidates.len(),
-                    gap_ratio
-                );
-                pending_low_confidence_matches = Some(matched_candidates);
-                continue;
-            }
-
+            let matched_candidates = collect_matched_candidates(&chunk, &match_ids);
             println!(
-                "✅ 在第 {} 组(按价格升序)命中同款，停止后续组比对。",
-                chunk_index + 1
+                "📌 第 {} 组命中 {} 个高度相似候选。",
+                chunk_index + 1,
+                matched_candidates.len()
             );
-            return Ok(find_cheapest(matched_candidates));
-        } else if let Some(pending) = pending_low_confidence_matches.take() {
-            println!("⚠️ 复查组图片下载失败，采用上一组低价命中结果。");
-            return Ok(find_cheapest(pending));
+            Ok(matched_candidates)
+        })
+    });
+
+    let compare_results = join_all(compare_tasks).await;
+    let mut merged_matches = Vec::new();
+    let mut has_success_group = false;
+
+    for task_result in compare_results {
+        let result = match task_result {
+            Ok(result) => result,
+            Err(e) => {
+                println!("⚠️ 并发任务异常终止: {}", e);
+                continue;
+            }
+        };
+        match result {
+            Ok(mut group_matches) => {
+                has_success_group = true;
+                merged_matches.append(&mut group_matches);
+            }
+            Err(_) => {}
         }
     }
 
-    if let Some(pending) = pending_low_confidence_matches.take() {
-        return Ok(find_cheapest(pending));
+    if !has_success_group {
+        return Err("大模型API调用异常/超时");
     }
 
-    Ok(None)
+    println!("✅ 并发比对完成，开始终选复核并按价格选择最低同款。");
+    Ok(pick_cheapest_after_final_review(client, ozon_base64, merged_matches, ozon_name_opt).await)
 }
 
 // ==========================================
 // 4. 调度总枢纽
 // ==========================================
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     // 🌟 核心破局点：使用 .no_proxy() 强制断开与 Clash/VPN 的联系，直达 Node.js！
     let client = reqwest::Client::builder()
@@ -696,13 +828,60 @@ async fn main() {
             {
                 if !candidates_pass1.is_empty() {
                     match process_candidates(&client, &ozon_base64, candidates_pass1, None).await {
-                        Ok(Some(cheapest)) => {
+                        Ok(MatchSummary::Cheapest(cheapest)) => {
                             println!("✅ 第一重召回成功锁定最低价！");
                             final_cheapest = Some(cheapest);
                             final_status_msg = "AI比对成功(一次召回)".to_string();
                         }
-                        Ok(None) => {
-                            println!("⚠️ 警告：第一重视觉召回(3轮)确认无同款，触发二次重绘！");
+                        Ok(MatchSummary::NoMatch) => {
+                            println!(
+                                "⚠️ 第一重视觉召回({}组并发)未命中同款，触发二次重绘！",
+                                MAX_VERIFY_GROUPS
+                            );
+                            if let Some(candidates_pass2) =
+                                fetch_1688_candidates(&client, &target_image_path, true).await
+                            {
+                                match process_candidates(
+                                    &client,
+                                    &ozon_base64,
+                                    candidates_pass2,
+                                    Some(&ozon_name),
+                                )
+                                .await
+                                {
+                                    Ok(MatchSummary::Cheapest(cheapest)) => {
+                                        println!("🏆 绝杀！大模型利用『语义排错』，在二次全图中成功揪出真同款！");
+                                        final_cheapest = Some(cheapest);
+                                        final_status_msg = "AI比对成功(二次全图召回)".to_string();
+                                    }
+                                    Ok(MatchSummary::NoMatch) => {
+                                        println!("❌ 两次召回均无果，确认为无同款。");
+                                        final_status_msg = "无真实同款(两轮兜底)".to_string();
+                                    }
+                                    Ok(MatchSummary::MatchedButPriceUnavailable {
+                                        total_matches,
+                                    }) => {
+                                        println!(
+                                            "⚠️ 二次召回命中 {} 个同款候选，但价格字段不可解析。",
+                                            total_matches
+                                        );
+                                        final_status_msg = "命中同款但价格不可解析".to_string();
+                                    }
+                                    Err(e) => {
+                                        println!("⚠️ 第二重召回时大模型崩溃中断: {}", e);
+                                        final_status_msg = format!("大模型API异常: {}", e);
+                                    }
+                                }
+                            } else {
+                                println!("⚠️ Node.js 第二次重绘故障。");
+                                final_status_msg = "Node爬虫二次获取失败".to_string();
+                            }
+                        }
+                        Ok(MatchSummary::MatchedButPriceUnavailable { total_matches }) => {
+                            println!(
+                                "⚠️ 第一重召回命中 {} 个同款候选，但价格字段不可解析，触发二次重绘补价！",
+                                total_matches
+                            );
 
                             if let Some(candidates_pass2) =
                                 fetch_1688_candidates(&client, &target_image_path, true).await
@@ -715,14 +894,24 @@ async fn main() {
                                 )
                                 .await
                                 {
-                                    Ok(Some(cheapest)) => {
+                                    Ok(MatchSummary::Cheapest(cheapest)) => {
                                         println!("🏆 绝杀！大模型利用『语义排错』，在二次全图中成功揪出真同款！");
                                         final_cheapest = Some(cheapest);
                                         final_status_msg = "AI比对成功(二次全图召回)".to_string();
                                     }
-                                    Ok(None) => {
-                                        println!("❌ 两次召回均无果，确认为无同款。");
-                                        final_status_msg = "无真实同款(两轮兜底)".to_string();
+                                    Ok(MatchSummary::NoMatch) => {
+                                        println!("⚠️ 二次召回未命中可确认同款。");
+                                        final_status_msg =
+                                            "命中同款但二次召回无可用报价".to_string();
+                                    }
+                                    Ok(MatchSummary::MatchedButPriceUnavailable {
+                                        total_matches,
+                                    }) => {
+                                        println!(
+                                            "⚠️ 两次召回均命中同款（第二轮 {} 条），但价格字段不可解析。",
+                                            total_matches
+                                        );
+                                        final_status_msg = "命中同款但价格不可解析".to_string();
                                     }
                                     Err(e) => {
                                         println!("⚠️ 第二重召回时大模型崩溃中断: {}", e);
@@ -791,10 +980,31 @@ mod tests {
         }
     }
 
+    fn candidate_with_price_and_url(price: &str, item_url: &str) -> Candidate {
+        Candidate {
+            title: "t".to_string(),
+            price: price.to_string(),
+            item_url: item_url.to_string(),
+            image_url: "i".to_string(),
+        }
+    }
+
     #[test]
     fn parse_price_value_extracts_min_from_range() {
         let price = parse_price_value("¥12.5-18.0");
         assert_eq!(price, Some(12.5));
+    }
+
+    #[test]
+    fn parse_price_value_ignores_moq_number_and_uses_currency_price() {
+        let price = parse_price_value("2件起批 ¥19.80");
+        assert_eq!(price, Some(19.8));
+    }
+
+    #[test]
+    fn parse_price_value_returns_none_when_no_currency_price() {
+        let price = parse_price_value("2件起批");
+        assert_eq!(price, None);
     }
 
     #[test]
@@ -828,123 +1038,20 @@ mod tests {
     }
 
     #[test]
-    fn build_verification_chunks_orders_by_price_and_caps_to_27() {
+    fn build_verification_chunks_orders_by_price_and_caps_to_36() {
         let mut candidates = Vec::new();
-        for i in (1..=30).rev() {
+        for i in (1..=50).rev() {
             candidates.push(candidate_with_price(&format!("¥{}", i)));
         }
 
         let chunks = build_verification_chunks(candidates);
-        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.len(), 4);
         assert_eq!(chunks[0].len(), 9);
+        assert_eq!(chunks[1].len(), 9);
         assert_eq!(chunks[2].len(), 9);
+        assert_eq!(chunks[3].len(), 9);
         assert_eq!(chunks[0][0].price, "¥1");
-        assert_eq!(chunks[2][8].price, "¥27");
-    }
-
-    #[test]
-    fn should_not_probe_when_hit_count_is_three() {
-        assert!(!should_probe_next_chunk(3, None, Some(0.2), true));
-    }
-
-    #[test]
-    fn should_not_probe_when_two_hits_and_stability_good() {
-        let stability = StabilityMetrics {
-            jaccard: 0.6,
-            cheapest_id_stable: true,
-        };
-        assert!(!should_probe_next_chunk(
-            2,
-            Some(&stability),
-            Some(0.1),
-            true
-        ));
-    }
-
-    #[test]
-    fn should_probe_when_two_hits_and_stability_weak() {
-        let stability = StabilityMetrics {
-            jaccard: 0.4,
-            cheapest_id_stable: true,
-        };
-        assert!(should_probe_next_chunk(
-            2,
-            Some(&stability),
-            Some(0.2),
-            true
-        ));
-    }
-
-    #[test]
-    fn should_not_probe_single_hit_without_stability_when_gap_large() {
-        assert!(!should_probe_next_chunk(1, None, Some(0.2), true));
-    }
-
-    #[test]
-    fn should_probe_single_hit_without_stability_when_gap_small() {
-        assert!(should_probe_next_chunk(1, None, Some(0.05), true));
-    }
-
-    #[test]
-    fn should_not_probe_when_single_hit_stable_and_gap_large() {
-        let stability = StabilityMetrics {
-            jaccard: 1.0,
-            cheapest_id_stable: true,
-        };
-        assert!(!should_probe_next_chunk(
-            1,
-            Some(&stability),
-            Some(0.15),
-            true
-        ));
-    }
-
-    #[test]
-    fn should_probe_when_single_hit_stable_but_gap_small() {
-        let stability = StabilityMetrics {
-            jaccard: 1.0,
-            cheapest_id_stable: true,
-        };
-        assert!(should_probe_next_chunk(
-            1,
-            Some(&stability),
-            Some(0.05),
-            true
-        ));
-    }
-
-    #[test]
-    fn should_probe_when_single_hit_unstable() {
-        let stability = StabilityMetrics {
-            jaccard: 0.0,
-            cheapest_id_stable: false,
-        };
-        assert!(should_probe_next_chunk(
-            1,
-            Some(&stability),
-            Some(0.2),
-            true
-        ));
-    }
-
-    #[test]
-    fn should_not_probe_without_next_chunk() {
-        let stability = StabilityMetrics {
-            jaccard: 0.0,
-            cheapest_id_stable: false,
-        };
-        assert!(!should_probe_next_chunk(
-            1,
-            Some(&stability),
-            Some(0.01),
-            false
-        ));
-    }
-
-    #[test]
-    fn compute_gap_ratio_returns_relative_difference() {
-        let gap = compute_gap_ratio(100.0, Some(120.0));
-        assert_eq!(gap, Some(0.2));
+        assert_eq!(chunks[3][8].price, "¥36");
     }
 
     #[test]
@@ -956,5 +1063,70 @@ mod tests {
         ];
         let cheapest = find_cheapest(candidates).expect("should find positive price");
         assert_eq!(cheapest.price, "¥2.5");
+    }
+
+    #[test]
+    fn summarize_matches_reports_no_match_on_empty() {
+        let summary = summarize_matches(Vec::new());
+        assert!(matches!(summary, MatchSummary::NoMatch));
+    }
+
+    #[test]
+    fn summarize_matches_reports_cheapest_when_price_is_parseable() {
+        let candidates = vec![
+            candidate_with_price("面议"),
+            candidate_with_price("¥6.5"),
+            candidate_with_price("¥5.2"),
+        ];
+
+        let summary = summarize_matches(candidates);
+        match summary {
+            MatchSummary::Cheapest(candidate) => assert_eq!(candidate.price, "¥5.2"),
+            _ => panic!("expected cheapest"),
+        }
+    }
+
+    #[test]
+    fn summarize_matches_reports_price_unavailable_when_only_non_numeric_prices() {
+        let candidates = vec![candidate_with_price("面议"), candidate_with_price("待议")];
+
+        let summary = summarize_matches(candidates);
+        match summary {
+            MatchSummary::MatchedButPriceUnavailable { total_matches } => {
+                assert_eq!(total_matches, 2)
+            }
+            _ => panic!("expected MatchedButPriceUnavailable"),
+        }
+    }
+
+    #[test]
+    fn prepare_final_review_candidates_deduplicates_and_sorts_by_price() {
+        let candidates = vec![
+            candidate_with_price_and_url("¥3.5", "u1"),
+            candidate_with_price_and_url("¥2.0", "u2"),
+            candidate_with_price_and_url("¥1.5", "u2"),
+            candidate_with_price_and_url("面议", "u3"),
+            candidate_with_price_and_url("¥1.8", "u4"),
+        ];
+
+        let prepared = prepare_final_review_candidates(candidates, 10);
+        assert_eq!(prepared.len(), 3);
+        assert_eq!(prepared[0].price, "¥1.8");
+        assert_eq!(prepared[1].price, "¥2.0");
+        assert_eq!(prepared[2].price, "¥3.5");
+    }
+
+    #[test]
+    fn prepare_final_review_candidates_respects_limit() {
+        let candidates = vec![
+            candidate_with_price_and_url("¥1.0", "u1"),
+            candidate_with_price_and_url("¥2.0", "u2"),
+            candidate_with_price_and_url("¥3.0", "u3"),
+        ];
+
+        let prepared = prepare_final_review_candidates(candidates, 2);
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared[0].price, "¥1.0");
+        assert_eq!(prepared[1].price, "¥2.0");
     }
 }
